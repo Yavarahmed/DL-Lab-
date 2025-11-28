@@ -1,0 +1,342 @@
+import re
+import ast
+import numpy as np
+import pandas as pd
+from tqdm.auto import tqdm
+
+import torch
+import torch.nn as nn
+from torch.utils.data import TensorDataset, DataLoader
+
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import f1_score, hamming_loss
+from sklearn.preprocessing import MultiLabelBinarizer
+
+from gensim.models import KeyedVectors
+from transformers import BertTokenizer, BertModel
+
+CSV_PATH = r"/kaggle/input/arxiv-paper-abstracts/arxiv_data_210930-054931.csv"
+
+EMBEDDING_INFO = {
+    "word2vec": {
+        "path": r"/kaggle/input/googlenewsvectors/GoogleNews-vectors-negative300.bin",
+        "binary": True
+    },
+    "glove": {
+        "path": r"/kaggle/input/glove6b300dtxt/glove.6B.300d.txt",
+        "binary": False,
+        "is_glove": True,
+    },
+    "fasttext": {
+        "path": r"/kaggle/input/fasttext-wikinews/wiki-news-300d-1M.vec",
+        "binary": False
+    }
+}
+
+BERT_MODEL_NAME = "bert-base-uncased"
+BATCH_SIZE_BERT = 16
+MAX_LEN_BERT = 256
+BATCH_SIZE_TRAIN = 64
+EPOCHS = 8
+LR = 1e-3
+SEED = 42
+
+if torch.cuda.is_available():
+    device = torch.device("cuda")
+elif torch.backends.mps.is_available():
+    device = torch.device("mps")
+else:
+    device = torch.device("cpu")
+print("Using device:", device)
+
+torch.manual_seed(SEED)
+np.random.seed(SEED)
+
+df = pd.read_csv(CSV_PATH)
+print("Columns:", df.columns.tolist())
+print("Shape:", df.shape)
+
+TITLE_COL = "titles"
+ABSTRACT_COL = "abstracts"
+TERMS_COL = "terms"
+
+df["text_full"] = df[TITLE_COL].fillna("").astype(str) + " " + df[ABSTRACT_COL].fillna("").astype(str)
+
+df = df.dropna(subset=["text_full", TERMS_COL]).copy()
+
+df["parsed_terms"] = df[TERMS_COL].apply(lambda x: ast.literal_eval(str(x)))
+
+mlb = MultiLabelBinarizer()
+labels = mlb.fit_transform(df["parsed_terms"]).astype("float32")
+
+LABELS = list(mlb.classes_)
+num_labels = len(LABELS)
+
+texts = df["text_full"].astype(str).tolist()
+
+print("Number of unique labels:", num_labels)
+print("First 20 labels:", LABELS[:20])
+print("Labels shape:", labels.shape)
+print("Example text:", texts[0][:200], "...")
+print("Example label vector sum (how many labels):", labels[0].sum())
+
+indices = np.arange(len(texts))
+idx_train, idx_temp, y_train, y_temp = train_test_split(indices, labels, test_size=0.25, random_state=SEED)
+idx_val, idx_test, y_val, y_test = train_test_split(idx_temp, y_temp, test_size=0.5, random_state=SEED)
+
+texts = np.array(texts)
+X_train_text = texts[idx_train]
+X_val_text = texts[idx_val]
+X_test_text = texts[idx_test]
+
+import html
+import emoji
+
+CONTRACTIONS = {
+    "can't": "cannot",
+    "won't": "will not",
+    "don't": "do not",
+    "doesn't": "does not",
+    "didn't": "did not",
+    "isn't": "is not",
+    "aren't": "are not",
+    "weren't": "were not",
+    "wasn't": "was not",
+    "i'm": "i am",
+    "you're": "you are",
+    "we're": "we are",
+    "they're": "they are",
+    "it's": "it is",
+    "that's": "that is",
+    "there's": "there is",
+    "i've": "i have",
+    "you've": "you have",
+    "we've": "we have",
+    "they've": "they have",
+    "i'll": "i will",
+    "you'll": "you will",
+    "we'll": "we will",
+    "they'll": "they will",
+    "i'd": "i would",
+    "you'd": "you would",
+    "we'd": "we would",
+    "they'd": "they would",
+}
+
+STOPWORDS = {
+    "the", "a", "an", "of", "and", "to", "in", "on", "for", "with", "at", "by",
+    "this", "that", "these", "those",
+    "is", "am", "are", "was", "were", "be", "been",
+    "it", "its", "as", "or", "so",
+    "do", "does", "did",
+    "you", "i", "we", "they", "he", "she", "him", "her", "them", "our", "your",
+    "from", "about", "into", "out", "up", "down",
+    "just", "very", "too"
+}
+
+def expand_contractions(text):
+    for contr, full in CONTRACTIONS.items():
+        text = re.sub(r"\b" + re.escape(contr) + r"\b", full, text)
+    return text
+
+def clean_text(text):
+    text = str(text)
+    text = html.unescape(text)
+    text = text.lower()
+    text = expand_contractions(text)
+    text = re.sub(r"http\S+|www\.\S+", " ", text)
+    text = re.sub(r"@\w+", " ", text)
+    text = re.sub(r"#(\w+)", r"\1", text)
+    text = emoji.replace_emoji(text, replace=" ")
+    text = re.sub(r"[^a-z0-9\s']", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+def simple_tokenize(text):
+    text = clean_text(text)
+    tokens = text.split()
+    tokens = [t for t in tokens if t not in STOPWORDS]
+    return tokens
+
+def load_keyed_vectors(info):
+    path = info["path"]
+    binary = info.get("binary", False)
+    is_glove = info.get("is_glove", False)
+    if is_glove:
+        converted_path = "/kaggle/working/glove_converted.txt"
+        from gensim.scripts.glove2word2vec import glove2word2vec
+        glove2word2vec(path, converted_path)
+        path = converted_path
+        binary = False
+    kv = KeyedVectors.load_word2vec_format(path, binary=binary)
+    return kv
+
+def compute_doc_embeddings(text_list, kv):
+    dim = kv.vector_size
+    embs = []
+    for text in tqdm(text_list):
+        toks = simple_tokenize(text)
+        vecs = [kv[w] for w in toks if w in kv]
+        if len(vecs) == 0:
+            embs.append(np.zeros(dim, dtype="float32"))
+        else:
+            embs.append(np.mean(vecs, axis=0).astype("float32"))
+    return np.vstack(embs)
+
+tokenizer = BertTokenizer.from_pretrained(BERT_MODEL_NAME)
+bert_model = BertModel.from_pretrained(BERT_MODEL_NAME).to(device)
+bert_model.eval()
+for p in bert_model.parameters():
+    p.requires_grad = False
+
+@torch.no_grad()
+def compute_bert_embeddings(text_list):
+    embs = []
+    for i in tqdm(range(0, len(text_list), BATCH_SIZE_BERT)):
+        raw_batch = text_list[i : i + BATCH_SIZE_BERT]
+        batch_texts = [clean_text(t) for t in raw_batch]
+        enc = tokenizer(batch_texts, padding=True, truncation=True, max_length=MAX_LEN_BERT, return_tensors="pt")
+        enc = {k: v.to(device) for k, v in enc.items()}
+        out = bert_model(**enc)
+        cls_emb = out.last_hidden_state[:, 0, :]
+        embs.append(cls_emb.cpu().numpy())
+    return np.vstack(embs).astype("float32")
+
+class MLPClassifier(nn.Module):
+    def __init__(self, input_dim, num_labels):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 256),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(256, num_labels)
+        )
+    def forward(self, x):
+        return self.net(x)
+
+def train_and_eval(X_train, y_train, X_val, y_val, X_test, y_test, name):
+    X_train_t = torch.tensor(X_train, dtype=torch.float32)
+    y_train_t = torch.tensor(y_train, dtype=torch.float32)
+    X_val_t = torch.tensor(X_val, dtype=torch.float32)
+    y_val_t = torch.tensor(y_val, dtype=torch.float32)
+    X_test_t = torch.tensor(X_test, dtype=torch.float32)
+    y_test_t = torch.tensor(y_test, dtype=torch.float32)
+
+    train_ds = TensorDataset(X_train_t, y_train_t)
+    val_ds = TensorDataset(X_val_t, y_val_t)
+    test_ds = TensorDataset(X_test_t, y_test_t)
+
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE_TRAIN, shuffle=True)
+    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE_TRAIN, shuffle=False)
+    test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE_TRAIN, shuffle=False)
+
+    input_dim = X_train.shape[1]
+    num_labels = y_train.shape[1]
+
+    model = MLPClassifier(input_dim, num_labels).to(device)
+    criterion = nn.BCEWithLogitsLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+
+    best_val_micro = 0.0
+    best_state = None
+
+    for epoch in range(1, EPOCHS + 1):
+        model.train()
+        total_loss = 0.0
+        for xb, yb in train_loader:
+            xb = xb.to(device)
+            yb = yb.to(device)
+            optimizer.zero_grad()
+            logits = model(xb)
+            loss = criterion(logits, yb)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item() * xb.size(0)
+        avg_loss = total_loss / len(train_ds)
+
+        model.eval()
+        all_y = []
+        all_pred = []
+        with torch.no_grad():
+            for xb, yb in val_loader:
+                xb = xb.to(device)
+                yb = yb.to(device)
+                logits = model(xb)
+                probs = torch.sigmoid(logits)
+                preds = (probs >= 0.5).float()
+                all_y.append(yb.cpu().numpy())
+                all_pred.append(preds.cpu().numpy())
+        y_true = np.vstack(all_y)
+        y_pred = np.vstack(all_pred)
+
+        micro_f1 = f1_score(y_true, y_pred, average="micro", zero_division=0)
+        macro_f1 = f1_score(y_true, y_pred, average="macro", zero_division=0)
+        h_loss = hamming_loss(y_true, y_pred)
+
+        if micro_f1 > best_val_micro:
+            best_val_micro = micro_f1
+            best_state = model.state_dict()
+
+        print(f"[{name}] Epoch {epoch}/{EPOCHS} | Train loss {avg_loss:.4f} | Val micro-F1 {micro_f1:.4f} | Val macro-F1 {macro_f1:.4f} | Val Hamming {h_loss:.4f}")
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    model.eval()
+    all_y = []
+    all_pred = []
+    with torch.no_grad():
+        for xb, yb in test_loader:
+            xb = xb.to(device)
+            yb = yb.to(device)
+            logits = model(xb)
+            probs = torch.sigmoid(logits)
+            preds = (probs >= 0.5).float()
+            all_y.append(yb.cpu().numpy())
+            all_pred.append(preds.cpu().numpy())
+    y_true = np.vstack(all_y)
+    y_pred = np.vstack(all_pred)
+
+    micro_f1 = f1_score(y_true, y_pred, average="micro", zero_division=0)
+    macro_f1 = f1_score(y_true, y_pred, average="macro", zero_division=0)
+    h_loss = hamming_loss(y_true, y_pred)
+
+    print(f"\n==== TEST RESULTS: {name} ====")
+    print(f"Micro-F1 : {micro_f1:.4f}")
+    print(f"Macro-F1 : {macro_f1:.4f}")
+    print(f"Hamming  : {h_loss:.4f}\n")
+
+    return micro_f1, macro_f1, h_loss
+
+results = {}
+
+kv_w2v = load_keyed_vectors(EMBEDDING_INFO["word2vec"])
+X_train_w2v = compute_doc_embeddings(X_train_text, kv_w2v)
+X_val_w2v = compute_doc_embeddings(X_val_text, kv_w2v)
+X_test_w2v = compute_doc_embeddings(X_test_text, kv_w2v)
+results["Word2Vec"] = train_and_eval(X_train_w2v, y_train, X_val_w2v, y_val, X_test_w2v, y_test, "Word2Vec")
+
+kv_glove = load_keyed_vectors(EMBEDDING_INFO["glove"])
+X_train_glove = compute_doc_embeddings(X_train_text, kv_glove)
+X_val_glove = compute_doc_embeddings(X_val_text, kv_glove)
+X_test_glove = compute_doc_embeddings(X_test_text, kv_glove)
+results["GloVe"] = train_and_eval(X_train_glove, y_train, X_val_glove, y_val, X_test_glove, y_test, "GloVe")
+
+kv_ft = load_keyed_vectors(EMBEDDING_INFO["fasttext"])
+X_train_ft = compute_doc_embeddings(X_train_text, kv_ft)
+X_val_ft = compute_doc_embeddings(X_val_text, kv_ft)
+X_test_ft = compute_doc_embeddings(X_test_text, kv_ft)
+results["FastText"] = train_and_eval(X_train_ft, y_train, X_val_ft, y_val, X_test_ft, y_test, "FastText")
+
+X_train_bert = compute_bert_embeddings(list(X_train_text))
+X_val_bert = compute_bert_embeddings(list(X_val_text))
+X_test_bert = compute_bert_embeddings(list(X_test_text))
+results["BERT"] = train_and_eval(X_train_bert, y_train, X_val_bert, y_val, X_test_bert, y_test, "BERT")
+
+print("==== SUMMARY (Micro-F1, Macro-F1, Hamming) ====")
+for name, (mi, ma, h) in results.items():
+    print(f"{name:8s} -> Micro-F1 {mi:.4f} | Macro-F1 {ma:.4f} | Hamming {h:.4f}")
+
+print("\nLabel index -> term mapping:")
+for idx, term in enumerate(LABELS):
+    print(idx, "->", term)
