@@ -1,0 +1,163 @@
+pip install --quiet "bertopic[visualization]" 
+
+
+import os, re
+from pathlib import Path
+import numpy as np
+import pandas as pd
+from tqdm.auto import tqdm
+import matplotlib.pyplot as plt
+from wordcloud import WordCloud
+import warnings
+warnings.filterwarnings("ignore")
+
+from sentence_transformers import SentenceTransformer
+from bertopic import BERTopic
+from bertopic.representation import KeyBERTInspired
+from sklearn.feature_extraction.text import TfidfVectorizer
+from umap import UMAP
+import hdbscan
+
+from bertopic.plotting import (
+    visualize_barchart,
+    visualize_hierarchy,
+    visualize_topics,
+    visualize_documents,
+    visualize_term_rank,
+    visualize_topics_over_time,
+)
+
+from gensim.corpora import Dictionary
+from gensim.models import CoherenceModel
+from gensim.utils import simple_preprocess
+
+DATA_ROOT = r"/kaggle/input/20-newsgroups/mini_newsgroups/mini_newsgroups"
+EMBEDDING_MODEL = "all-MiniLM-L6-v2"
+UMAP_N_NEIGHBORS = 15
+UMAP_MIN_DIST = 0.1
+UMAP_N_COMPONENTS = 5
+HDBSCAN_MIN_CLUSTER_SIZE = 40
+TOP_N_WORDS = 12
+CALCULATE_PROBABILITIES = False
+RANDOM_STATE = 42
+
+def load_texts_simple(root_dir, max_files=None, min_tokens=6):
+    p = Path(root_dir)
+    docs, paths = [], []
+    for file in p.rglob("*"):
+        if not file.is_file():
+            continue
+        try:
+            text = file.read_text(encoding="utf8", errors="replace").strip()
+        except Exception:
+            continue
+        if not text:
+            continue
+        if len(text.split()) < min_tokens:
+            continue
+        docs.append(text)
+        paths.append(str(file))
+        if max_files and len(docs) >= max_files:
+            break
+    return docs, paths
+
+def light_preprocess(text):
+    text = re.sub(r"(^|\n)(from|subject|to|cc|reply-to|message-id):.*(\n|$)", " ", text, flags=re.I)
+    text = re.sub(r"http\S+|www\.\S+", " ", text)
+    text = re.sub(r"\S+@\S+", " ", text)
+    text = re.sub(r"[-]{2,}.*", " ", text)
+    text = re.sub(r"[^A-Za-z0-9'\s]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+docs, paths = load_texts_simple(DATA_ROOT, max_files=None, min_tokens=6)
+
+print("Applying preprocessing...")
+docs_clean = [light_preprocess(d) for d in tqdm(docs)]
+
+print("Loading SentenceTransformer:", EMBEDDING_MODEL)
+embedder = SentenceTransformer(EMBEDDING_MODEL)
+
+print("Computing embeddings...")
+embeddings = embedder.encode(docs_clean, show_progress_bar=True, convert_to_numpy=True)
+print("Embeddings shape:", embeddings.shape)
+
+print("Fitting UMAP...")
+umap_model = UMAP(n_neighbors=UMAP_N_NEIGHBORS,
+                  n_components=UMAP_N_COMPONENTS,
+                  min_dist=UMAP_MIN_DIST,
+                  metric="cosine",
+                  random_state=RANDOM_STATE)
+embeddings_reduced = umap_model.fit_transform(embeddings)
+print("UMAP reduced shape:", embeddings_reduced.shape)
+
+print("Fitting HDBSCAN...")
+hdbscan_model = hdbscan.HDBSCAN(min_cluster_size=HDBSCAN_MIN_CLUSTER_SIZE,
+                                metric='euclidean',
+                                cluster_selection_method='eom',
+                                prediction_data=True)
+labels = hdbscan_model.fit_predict(embeddings_reduced)
+n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
+n_noise = int((labels == -1).sum())
+print(f"HDBSCAN found {n_clusters} clusters. Noise points: {n_noise}")
+
+print("Building BERTopic model...")
+vectorizer = TfidfVectorizer(ngram_range=(1,2), max_df=0.85, min_df=5)
+representation = KeyBERTInspired()
+
+topic_model = BERTopic(
+    embedding_model=embedder,
+    umap_model=umap_model,
+    hdbscan_model=hdbscan_model,
+    vectorizer_model=vectorizer,
+    representation_model=representation,
+    top_n_words=TOP_N_WORDS,
+    calculate_probabilities=CALCULATE_PROBABILITIES,
+    verbose=True
+)
+
+print("Fitting BERTopic...")
+topics, probs = topic_model.fit_transform(docs_clean, embeddings)
+
+print("\n=== TOPIC INFO ===")
+print(topic_model.get_topic_info().head(15).to_string(index=False))
+
+tokenized_docs = [simple_preprocess(doc) for doc in docs_clean]
+
+topics_dict = topic_model.get_topics()
+topic_words = []
+for tid, words in topics_dict.items():
+    if tid != -1:
+        topic_words.append([w for w, _ in words[:TOP_N_WORDS]])
+
+dictionary = Dictionary(tokenized_docs)
+cm = CoherenceModel(topics=topic_words, texts=tokenized_docs,
+                    dictionary=dictionary, coherence='c_v')
+
+print("Overall Coherence (c_v):", round(cm.get_coherence(), 4))
+
+fig_b = visualize_barchart(topic_model, top_n_topics=15)
+fig_b.show()
+
+fig_h = visualize_hierarchy(topic_model)
+fig_h.show()
+
+fig_t = visualize_topics(topic_model)
+fig_t.show()
+
+fig_d = visualize_documents(topic_model, docs_clean)
+fig_d.show()
+
+print("\nDisplaying WordClouds...")
+topic_info = topic_model.get_topic_info()
+top_topics = topic_info[topic_info.Topic != -1].head(5).Topic.tolist()
+for tid in top_topics:
+    words_freq = dict(topic_model.get_topic(int(tid)))
+    if not words_freq:
+        continue
+    wc = WordCloud(width=900, height=400, background_color="white").generate_from_frequencies(words_freq)
+    plt.figure(figsize=(12,5))
+    plt.imshow(wc, interpolation='bilinear')
+    plt.axis("off")
+    plt.title(f"WordCloud — Topic {tid}")
+    plt.show()
